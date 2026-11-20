@@ -1,23 +1,28 @@
-# GUESS ARENA — Stage 1
+# GUESS ARENA — Stage 2 Foundation
 
-## Render environment variables
-- `BOT_TOKEN`: existing Telegram bot token (keep it secret).
-- `DATABASE_URL`: Render PostgreSQL Internal Database URL.
+## Render settings
+Build command: `pip install -r requirements.txt`
+Start command: `python app.py`
 
-## Render commands
-Build: `pip install -r requirements.txt`
-Start: `python app.py`
+Keep existing `BOT_TOKEN` and `DATABASE_URL`.
+Add `ADMIN_IDS` as a comma-separated list of numeric Telegram user IDs.
+Use `/myid` in the bot to display your own Telegram ID.
 
-## Included in this starter stage
-- PostgreSQL player records
-- Number guessing game (1–150, six attempts)
-- Points and XP for wins
-- Daily XP reward
-- Profile and top-10 leaderboard
-- Basic account name/password setup
-- GET and HEAD health checks
+## Implemented in this stage
+- PostgreSQL schema for players, teams, team membership, tournaments, entries,
+  shop items, inventory, seasons and season deductions.
+- Main menu with player and admin sections.
+- Admin-only commands for stats, points adjustment, ban/unban, tournament creation,
+  season creation and season ending with one-time 20% player-point deduction.
+- Four-player team capacity, team creation and invite-code joining.
+- Tournament listing and player registration.
+- Shop purchases and inventory listing.
+- Guessing game, profile, leaderboard and daily XP reward.
+- GET and HEAD health checks.
 
-## Important
-This is an initial starter stage, not the complete GUESS ARENA specification.
-Friend challenges, teams, tournaments, shop, payments, seasons, admin tools and other
-previously discussed systems are not implemented here. Test before public launch.
+## Not yet complete
+Friend requests and in-bot friend challenges, team-vs-team match engine and
+tournament brackets/results, item activation and match effects, team seasonal
+rewards and longest-win-streak award, advanced game mode, Telegram Stars,
+moderation workflows, detailed audit logs and full automated tests are still
+planned for subsequent stages. Do not treat this as the final complete release.
