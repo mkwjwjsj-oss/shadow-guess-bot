@@ -1,663 +1,285 @@
-
 import os
 import json
 import time
 import random
-import asyncio
-import threading
-import uuid
+import hashlib
+import secrets
+import logging
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from threading import Thread
 
-from telegram import (
-    Update,
-    ReplyKeyboardMarkup,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-)
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    filters,
+    ApplicationBuilder, CommandHandler, MessageHandler,
+    ContextTypes, filters
 )
 
-MIN_NUM = 1
-MAX_NUM = 50
-MAX_ATTEMPTS = 6
-CHALLENGE_TIME = 120
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("guess-arena")
 
-DATA_FILE = os.environ.get("DATA_FILE", "scores.json")
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+DATABASE_URL = os.environ["DATABASE_URL"]
 
-games = {}
-scores = {}
-invitations = {}
-challenges = {}
-active_challenges = {}
-
-POINTS = {
-    1: 10,
-    2: 8,
-    3: 6,
-    4: 4,
-    5: 2,
-    6: 1,
-}
-
-keyboard = ReplyKeyboardMarkup(
-    [
-        ["🎮 ابدأ التخمين"],
-        ["🏆 قائمة المتصدرين", "🎁 المكافأة اليومية"],
-        ["👥 تحدي صديق"],
-    ],
-    resize_keyboard=True
-)
-
-
-def load_scores():
-    try:
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        for entry in data.values():
-            entry.setdefault("points", 0)
-            entry.setdefault("wins", 0)
-            entry.setdefault("losses", 0)
-            entry.setdefault("last_daily", 0)
-            entry.setdefault("name", "لاعب")
-            entry.setdefault("username", "")
-
-        return data
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-
-
-scores = load_scores()
-
-
-def save_scores():
-    temp_file = DATA_FILE + ".tmp"
-
-    with open(temp_file, "w", encoding="utf-8") as f:
-        json.dump(scores, f, ensure_ascii=False, indent=2)
-
-    os.replace(temp_file, DATA_FILE)
-
-
-def register_user(user):
-    uid = str(user.id)
-
-    if uid not in scores:
-        scores[uid] = {
-            "name": user.first_name or "لاعب",
-            "username": user.username or "",
-            "points": 0,
-            "wins": 0,
-            "losses": 0,
-            "last_daily": 0,
-        }
-
-    scores[uid]["name"] = user.first_name or "لاعب"
-    scores[uid]["username"] = user.username or ""
-
-    save_scores()
-    return scores[uid]
-
-
-def player_name(uid):
-    entry = scores.get(str(uid), {})
-    username = entry.get("username", "")
-
-    if username:
-        return "@" + username
-
-    return entry.get("name", "لاعب")
-
-
-def find_user_by_username(username):
-    username = username.lstrip("@").lower()
-
-    for uid, entry in scores.items():
-        saved = entry.get("username", "").lower()
-
-        if saved and saved == username:
-            return uid
-
-    return None
-
-
+# Render health check: supports both GET and HEAD.
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot is running!")
+        self.wfile.write(b"GUESS ARENA OK")
 
-    def log_message(self, *args):
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
+
+    def log_message(self, *_):
         pass
 
+def run_health_server():
+    port = int(os.getenv("PORT", "10000"))
+    HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
 
-def start_server():
-    port = int(os.environ.get("PORT", "8080"))
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+def db():
+    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
-    threading.Thread(
-        target=server.serve_forever,
-        daemon=True
-    ).start()
+def init_db():
+    with db() as con:
+        with con.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS players (
+                    telegram_id BIGINT PRIMARY KEY,
+                    username TEXT,
+                    account_name TEXT UNIQUE,
+                    password_hash TEXT,
+                    salt TEXT,
+                    points INTEGER NOT NULL DEFAULT 0,
+                    xp INTEGER NOT NULL DEFAULT 0,
+                    wins INTEGER NOT NULL DEFAULT 0,
+                    last_daily BIGINT NOT NULL DEFAULT 0,
+                    created_at BIGINT NOT NULL
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS friendships (
+                    id BIGSERIAL PRIMARY KEY,
+                    requester BIGINT NOT NULL REFERENCES players(telegram_id) ON DELETE CASCADE,
+                    target BIGINT NOT NULL REFERENCES players(telegram_id) ON DELETE CASCADE,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    created_at BIGINT NOT NULL,
+                    UNIQUE(requester, target)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS global_flags (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+            """)
+            cur.execute("INSERT INTO global_flags(key,value) VALUES('ambassador_awarded','0') ON CONFLICT DO NOTHING")
 
+def get_player(tg_id):
+    with db() as con:
+        with con.cursor() as cur:
+            cur.execute("SELECT * FROM players WHERE telegram_id=%s", (tg_id,))
+            return cur.fetchone()
+
+def ensure_player(user):
+    with db() as con:
+        with con.cursor() as cur:
+            cur.execute("""
+                INSERT INTO players(telegram_id, username, created_at)
+                VALUES(%s,%s,%s)
+                ON CONFLICT(telegram_id) DO UPDATE SET username=EXCLUDED.username
+            """, (user.id, user.username or user.first_name, int(time.time())))
+
+def main_menu():
+    return ReplyKeyboardMarkup([
+        ["🎮 العب", "👤 الملف الشخصي"],
+        ["🏆 المتصدرون", "🎁 تسجيل الدخول اليومي"],
+        ["👥 الأصدقاء", "⚙️ إعداد الحساب"],
+    ], resize_keyboard=True)
+
+def hash_password(password, salt=None):
+    salt = salt or secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt), 200000).hex()
+    return salt, digest
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    register_user(update.effective_user)
-
+    ensure_player(update.effective_user)
     await update.message.reply_text(
-        "أهلاً بك في لعبة تخمين الأرقام! 🎯\n\n"
-        "اختر من القائمة بالأسفل:",
-        reply_markup=keyboard
+        "أهلاً بك في GUESS ARENA! 🏟️\nاختر من القائمة للبدء.",
+        reply_markup=main_menu()
     )
 
-
-async def game(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    register_user(user)
-
-    uid = str(user.id)
-
-    if uid in active_challenges:
-        await update.message.reply_text(
-            "أنت داخل تحدي حالياً! أكمل التحدي أولاً."
-        )
-        return
-
-    games[uid] = {
-        "number": random.randint(MIN_NUM, MAX_NUM),
-        "attempts": 0,
-    }
-
-    await update.message.reply_text(
-        "🎮 بدأت لعبة جديدة!\n"
-        "اخترت رقماً بين 1 و50.\n"
-        "لديك 6 محاولات.\n\n"
-        "اكتب الرقم مباشرة!",
-        reply_markup=keyboard
-    )
-
-
-async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not scores:
-        await update.message.reply_text("لا يوجد لاعبون حتى الآن!")
-        return
-
-    ranking = sorted(
-        scores.items(),
-        key=lambda item: item[1]["points"],
-        reverse=True
-    )[:10]
-
-    medals = ["🥇", "🥈", "🥉"]
-    message = "🏆 قائمة أفضل 10 لاعبين\n\n"
-
-    for index, (uid, data) in enumerate(ranking):
-        medal = medals[index] if index < 3 else f"{index + 1}."
-        message += (
-            f"{medal} {player_name(uid)}\n"
-            f"💰 النقاط: {data['points']}\n"
-            f"🏆 الانتصارات: {data['wins']}\n\n"
-        )
-
-    await update.message.reply_text(message)
-
-
-async def daily_reward(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    entry = register_user(user)
-
-    now = time.time()
-    remaining = 86400 - (now - entry["last_daily"])
-
-    if remaining > 0:
-        hours = int(remaining // 3600)
-        minutes = int((remaining % 3600) // 60)
-
-        await update.message.reply_text(
-            f"🎁 حصلت على مكافأتك بالفعل!\n"
-            f"ارجع بعد {hours} ساعة و{minutes} دقيقة."
-        )
-        return
-
-    entry["points"] += 3
-    entry["last_daily"] = now
-    save_scores()
-
-    await update.message.reply_text(
-        "🎁 مبروك!\n"
-        "حصلت على 3 نقاط يومية!\n"
-        f"رصيدك الحالي: {entry['points']} نقطة."
-    )
-
-
-async def challenge_friend(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = str(update.effective_user.id)
-
-    if uid in active_challenges:
-        await update.message.reply_text("أنت داخل تحدي حالياً!")
-        return
-
-    context.user_data["awaiting_opponent"] = True
-
-    await update.message.reply_text(
-        "👥 اكتب يوزر صديقك الآن.\n"
-        "مثال: @ahmad\n\n"
-        "يجب أن يكون صديقك قد بدأ البوت باستخدام /start."
-    )
-
-
-async def create_invitation(update: Update, context: ContextTypes.DEFAULT_TYPE, username):
-    user = update.effective_user
-    uid = str(user.id)
-
-    opponent_id = find_user_by_username(username)
-
-    if not opponent_id:
-        await update.message.reply_text(
-            "لم أجد هذا اللاعب.\n"
-            "تأكد أنه ضغط /start في البوت وأن اليوزر صحيح."
-        )
-        return
-
-    if opponent_id == uid:
-        await update.message.reply_text("لا يمكنك تحدي نفسك 😄")
-        return
-
-    if uid in active_challenges or opponent_id in active_challenges:
-        await update.message.reply_text(
-            "أحد اللاعبين داخل تحدي حالياً."
-        )
-        return
-
-    invitation_id = uuid.uuid4().hex[:12]
-
-    invitations[invitation_id] = {
-        "from": uid,
-        "to": opponent_id,
-    }
-
-    buttons = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "✅ قبول التحدي",
-                callback_data=f"accept:{invitation_id}"
-            ),
-            InlineKeyboardButton(
-                "❌ رفض",
-                callback_data=f"decline:{invitation_id}"
-            ),
-        ]
-    ])
-
-    await context.bot.send_message(
-        chat_id=int(opponent_id),
-        text=(
-            f"⚔️ وصلك تحدي من {player_name(uid)}!\n\n"
-            "هل تريد قبول التحدي؟"
-        ),
-        reply_markup=buttons
-    )
-
-    await update.message.reply_text(
-        f"📨 تم إرسال دعوة التحدي إلى {player_name(opponent_id)}."
-    )
-
-
-async def handle_invitation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    action, invitation_id = query.data.split(":", 1)
-    invitation = invitations.get(invitation_id)
-
-    if not invitation:
-        await query.edit_message_text("انتهت صلاحية هذه الدعوة.")
-        return
-
-    uid = str(query.from_user.id)
-
-    if uid != invitation["to"]:
-        await query.answer("هذه الدعوة ليست لك!", show_alert=True)
-        return
-
-    if action == "decline":
-        del invitations[invitation_id]
-
-        await query.edit_message_text("❌ رفضت التحدي.")
-
-        await context.bot.send_message(
-            chat_id=int(invitation["from"]),
-            text=f"رفض {player_name(uid)} التحدي."
-        )
-        return
-
-    first = invitation["from"]
-    second = invitation["to"]
-
-    if first in active_challenges or second in active_challenges:
-        del invitations[invitation_id]
-        await query.edit_message_text("أحد اللاعبين بدأ تحدياً آخر.")
-        return
-
-    del invitations[invitation_id]
-
-    challenge_id = uuid.uuid4().hex[:12]
-    starter = random.choice([first, second])
-
-    challenges[challenge_id] = {
-        "players": [first, second],
-        "number": random.randint(MIN_NUM, MAX_NUM),
-        "attempts": {
-            first: 0,
-            second: 0,
-        },
-        "turn": starter,
-        "active": True,
-    }
-
-    active_challenges[first] = challenge_id
-    active_challenges[second] = challenge_id
-
-    await query.edit_message_text("✅ قبلت التحدي! بدأت المباراة.")
-
-    await context.bot.send_message(
-        chat_id=int(first),
-        text=(
-            f"⚔️ بدأ التحدي ضد {player_name(second)}!\n"
-            "🎲 تم اختيار أول لاعب عشوائياً.\n"
-            "⏱️ الوقت: دقيقتان.\n"
-            "لكل لاعب 6 محاولات.\n\n"
-            + ("🎯 دورك الآن! اكتب رقماً من 1 إلى 50."
-               if starter == first else "⏳ انتظر دورك.")
-        )
-    )
-
-    await context.bot.send_message(
-        chat_id=int(second),
-        text=(
-            f"⚔️ بدأ التحدي ضد {player_name(first)}!\n"
-            "🎲 تم اختيار أول لاعب عشوائياً.\n"
-            "⏱️ الوقت: دقيقتان.\n"
-            "لكل لاعب 6 محاولات.\n\n"
-            + ("🎯 دورك الآن! اكتب رقماً من 1 إلى 50."
-               if starter == second else "⏳ انتظر دورك.")
-        )
-    )
-
-    asyncio.create_task(
-        expire_challenge(challenge_id, context.bot)
-    )
-
-
-async def finish_challenge(challenge_id, bot, winner=None):
-    challenge = challenges.get(challenge_id)
-
-    if not challenge or not challenge["active"]:
-        return
-
-    challenge["active"] = False
-
-    first, second = challenge["players"]
-
-    for uid in [first, second]:
-        active_challenges.pop(uid, None)
-
-    secret = challenge["number"]
-
-    if winner:
-        attempts = challenge["attempts"][winner]
-        points = POINTS[attempts] + 3
-
-        scores[winner]["points"] += points
-        scores[winner]["wins"] += 1
-
-        loser = second if winner == first else first
-        scores[loser]["losses"] += 1
-
-        save_scores()
-
-        result = (
-            f"🏆 انتهى التحدي!\n"
-            f"الفائز: {player_name(winner)}\n"
-            f"الرقم الصحيح: {secret}\n"
-            f"محاولاته: {attempts}\n"
-            f"نقاط الفوز: {POINTS[attempts]}\n"
-            f"مكافأة التحدي: 3 نقاط\n"
-            f"مجموع النقاط المكتسبة: {points}"
-        )
+async def account_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    p = get_player(update.effective_user.id)
+    if p and p["account_name"]:
+        context.user_data["account_step"] = "new_password"
+        await update.message.reply_text("أرسل كلمة المرور الجديدة لتغييرها.")
     else:
-        result = (
-            "⏱️ انتهى التحدي دون فائز!\n"
-            f"الرقم الصحيح كان: {secret}"
-        )
+        context.user_data["account_step"] = "account_name"
+        await update.message.reply_text("أرسل اسم الحساب الذي تريد استخدامه.")
 
-    for uid in [first, second]:
-        try:
-            await bot.send_message(
-                chat_id=int(uid),
-                text=result,
-                reply_markup=keyboard
-            )
-        except Exception:
-            pass
+async def handle_account(update, context):
+    step = context.user_data.get("account_step")
+    if not step:
+        return False
+    value = update.message.text.strip()
+    tg_id = update.effective_user.id
+    if step == "account_name":
+        if len(value) < 3 or len(value) > 24:
+            await update.message.reply_text("اسم الحساب يجب أن يكون من 3 إلى 24 حرفاً.")
+            return True
+        with db() as con:
+            with con.cursor() as cur:
+                cur.execute("SELECT 1 FROM players WHERE account_name=%s", (value,))
+                if cur.fetchone():
+                    await update.message.reply_text("هذا الاسم مستخدم. جرّب اسماً آخر.")
+                    return True
+        context.user_data["pending_account_name"] = value
+        context.user_data["account_step"] = "set_password"
+        await update.message.reply_text("ممتاز. أرسل كلمة مرور من 8 أحرف أو أكثر.")
+        return True
+    if step in ("set_password", "new_password"):
+        if len(value) < 8:
+            await update.message.reply_text("كلمة المرور يجب أن تكون 8 أحرف على الأقل.")
+            return True
+        salt, digest = hash_password(value)
+        with db() as con:
+            with con.cursor() as cur:
+                if step == "set_password":
+                    cur.execute("""
+                        UPDATE players SET account_name=%s,password_hash=%s,salt=%s
+                        WHERE telegram_id=%s
+                    """, (context.user_data.pop("pending_account_name"), digest, salt, tg_id))
+                else:
+                    cur.execute("UPDATE players SET password_hash=%s,salt=%s WHERE telegram_id=%s",
+                                (digest, salt, tg_id))
+        context.user_data.pop("account_step", None)
+        await update.message.reply_text("تم حفظ إعدادات الحساب بنجاح ✅", reply_markup=main_menu())
+        return True
+    return False
 
+async def play(update, context):
+    context.user_data["game"] = {
+        "number": random.randint(1, 150),
+        "attempt": 0,
+        "max": 150,
+        "scores": [10, 8, 6, 4, 2, 1],
+        "xp": [100, 85, 70, 60, 50, 40],
+    }
+    await update.message.reply_text("🎮 اخترت الوضع العادي (1 إلى 150).\nعندك 6 محاولات. أرسل تخمينك كرقم.")
 
-async def expire_challenge(challenge_id, bot):
-    await asyncio.sleep(CHALLENGE_TIME)
-
-    challenge = challenges.get(challenge_id)
-
-    if challenge and challenge["active"]:
-        await finish_challenge(challenge_id, bot)
-
-
-async def process_guess(update, context, number):
-    user = update.effective_user
-    uid = str(user.id)
-
-    register_user(user)
-
-    if not MIN_NUM <= number <= MAX_NUM:
-        await update.message.reply_text("أدخل رقماً بين 1 و50.")
+async def profile(update, context):
+    p = get_player(update.effective_user.id)
+    if not p:
+        await update.message.reply_text("اكتب /start أولاً.")
         return
+    level = max(1, p["xp"] // 500 + 1)
+    await update.message.reply_text(
+        f"👤 الملف الشخصي\n"
+        f"الحساب: {p['account_name'] or 'غير مضبوط'}\n"
+        f"النقاط: {p['points']}\nXP: {p['xp']}\n"
+        f"المستوى: {level}\nالانتصارات: {p['wins']}"
+    )
 
-    challenge_id = active_challenges.get(uid)
+async def leaderboard(update, context):
+    with db() as con:
+        with con.cursor() as cur:
+            cur.execute("SELECT account_name,username,points,wins FROM players ORDER BY points DESC,wins DESC LIMIT 10")
+            rows = cur.fetchall()
+    if not rows:
+        await update.message.reply_text("لا يوجد لاعبون في التصنيف بعد.")
+        return
+    lines = ["🏆 أفضل 10 لاعبين:"]
+    for i, p in enumerate(rows, 1):
+        lines.append(f"{i}. {p['account_name'] or p['username'] or 'لاعب'} — {p['points']} نقطة")
+    await update.message.reply_text("\n".join(lines))
 
-    if challenge_id:
-        challenge = challenges.get(challenge_id)
-
-        if not challenge or not challenge["active"]:
-            return
-
-        if challenge["turn"] != uid:
-            await update.message.reply_text("⏳ ليس دورك الآن، انتظر صديقك.")
-            return
-
-        challenge["attempts"][uid] += 1
-        attempt = challenge["attempts"][uid]
-        secret = challenge["number"]
-
-        if number == secret:
-            await finish_challenge(challenge_id, context.bot, uid)
-            return
-
-        remaining = MAX_ATTEMPTS - attempt
-        hint = "أكبر 🔼" if number < secret else "أصغر 🔽"
-
-        await update.message.reply_text(
-            f"❌ الرقم السري {hint} من {number}.\n"
-            f"محاولاتك المتبقية: {remaining}"
-        )
-
-        other = (
-            challenge["players"][1]
-            if uid == challenge["players"][0]
-            else challenge["players"][0]
-        )
-
-        if challenge["attempts"][other] >= MAX_ATTEMPTS:
-            if remaining <= 0:
-                await finish_challenge(challenge_id, context.bot)
+async def daily(update, context):
+    tg_id = update.effective_user.id
+    now = int(time.time())
+    with db() as con:
+        with con.cursor() as cur:
+            cur.execute("SELECT last_daily FROM players WHERE telegram_id=%s", (tg_id,))
+            row = cur.fetchone()
+            if not row:
+                await update.message.reply_text("اكتب /start أولاً.")
                 return
-            next_player = uid
-        else:
-            next_player = other
+            if now - row["last_daily"] < 86400:
+                remaining = 86400 - (now - row["last_daily"])
+                hours, rem = divmod(remaining, 3600)
+                await update.message.reply_text(f"استلمت مكافأتك اليومية. ارجع بعد {hours} ساعة تقريباً.")
+                return
+            cur.execute("UPDATE players SET xp=xp+20,last_daily=%s WHERE telegram_id=%s", (now, tg_id))
+    await update.message.reply_text("🎁 حصلت على 20 XP لتسجيل الدخول اليومي!")
 
-        challenge["turn"] = next_player
-
-        if next_player == uid:
-            await update.message.reply_text("🎯 دورك مرة ثانية!")
-        else:
-            await context.bot.send_message(
-                chat_id=int(other),
-                text=f"🎯 دورك الآن! {player_name(uid)} خمّن رقماً."
-            )
-        return
-
-    current = games.get(uid)
-
-    if not current:
-        await update.message.reply_text(
-            "ابدأ لعبة أولاً من زر 🎮 ابدأ التخمين."
-        )
-        return
-
-    current["attempts"] += 1
-    attempt = current["attempts"]
-
-    if number == current["number"]:
-        points = POINTS[attempt]
-
-        scores[uid]["points"] += points
-        scores[uid]["wins"] += 1
-        save_scores()
-
-        del games[uid]
-
-        await update.message.reply_text(
-            f"🏆 مبروك! الرقم الصحيح هو {number}!\n"
-            f"عدد محاولاتك: {attempt}\n"
-            f"💰 حصلت على {points} نقطة!\n"
-            f"رصيدك: {scores[uid]['points']}",
-            reply_markup=keyboard
-        )
-        return
-
-    remaining = MAX_ATTEMPTS - attempt
-
-    if remaining <= 0:
-        scores[uid]["losses"] += 1
-        save_scores()
-        secret = current["number"]
-        del games[uid]
-
-        await update.message.reply_text(
-            f"انتهت المحاولات!\n"
-            f"الرقم كان {secret}.",
-            reply_markup=keyboard
-        )
-        return
-
-    hint = "أكبر 🔼" if number < current["number"] else "أصغر 🔽"
-
+async def friends(update, context):
     await update.message.reply_text(
-        f"الرقم السري {hint} من {number}.\n"
-        f"المحاولات المتبقية: {remaining}"
+        "👥 نظام الأصدقاء قيد التجهيز في هذه النسخة.\n"
+        "طلبات الصداقة والتحديات ستضاف في مرحلة لاحقة."
     )
 
-
-async def guess_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("اكتب /guess ثم الرقم.")
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
         return
-
-    try:
-        number = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("أدخل رقماً صحيحاً.")
+    if await handle_account(update, context):
         return
-
-    await process_guess(update, context, number)
-
-
-async def stopgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = str(update.effective_user.id)
-
-    if uid in active_challenges:
-        challenge_id = active_challenges[uid]
-        await finish_challenge(challenge_id, context.bot)
-        return
-
-    if uid in games:
-        del games[uid]
-        await update.message.reply_text(
-            "تم إيقاف اللعبة.",
-            reply_markup=keyboard
-        )
-    else:
-        await update.message.reply_text("لا توجد لعبة نشطة.")
-
-
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
-    uid = str(update.effective_user.id)
+    if text == "🎮 العب":
+        await play(update, context); return
+    if text == "👤 الملف الشخصي":
+        await profile(update, context); return
+    if text == "🏆 المتصدرون":
+        await leaderboard(update, context); return
+    if text == "🎁 تسجيل الدخول اليومي":
+        await daily(update, context); return
+    if text == "👥 الأصدقاء":
+        await friends(update, context); return
+    if text == "⚙️ إعداد الحساب":
+        await account_setup(update, context); return
 
-    register_user(update.effective_user)
-
-    if context.user_data.get("awaiting_opponent"):
-        context.user_data["awaiting_opponent"] = False
-        await create_invitation(update, context, text)
+    game = context.user_data.get("game")
+    if game:
+        try:
+            guess = int(text)
+        except ValueError:
+            await update.message.reply_text("أرسل رقماً صحيحاً بين 1 و150.")
+            return
+        if not 1 <= guess <= game["max"]:
+            await update.message.reply_text(f"الرقم يجب أن يكون بين 1 و{game['max']}.")
+            return
+        game["attempt"] += 1
+        attempt = game["attempt"]
+        if guess == game["number"]:
+            index = attempt - 1
+            points = game["scores"][index]
+            xp = game["xp"][index]
+            with db() as con:
+                with con.cursor() as cur:
+                    cur.execute("UPDATE players SET points=points+%s,xp=xp+%s,wins=wins+1 WHERE telegram_id=%s",
+                                (points, xp, update.effective_user.id))
+            context.user_data.pop("game", None)
+            await update.message.reply_text(f"🎉 صحيح! ربحت {points} نقطة و{xp} XP.")
+        elif attempt >= 6:
+            answer = game["number"]
+            context.user_data.pop("game", None)
+            await update.message.reply_text(f"انتهت المحاولات! الرقم كان {answer}.")
+        else:
+            hint = "أكبر 🔼" if guess < game["number"] else "أصغر 🔽"
+            await update.message.reply_text(f"{hint}\nباقي لك {6-attempt} محاولات.")
         return
-
-    if text == "🎮 ابدأ التخمين":
-        await game(update, context)
-    elif text == "🏆 قائمة المتصدرين":
-        await leaderboard(update, context)
-    elif text == "🎁 المكافأة اليومية":
-        await daily_reward(update, context)
-    elif text == "👥 تحدي صديق":
-        await challenge_friend(update, context)
-    elif text.isdigit():
-        await process_guess(update, context, int(text))
-
-
-async def post_init(application):
-    await application.bot.delete_webhook(drop_pending_updates=True)
-
+    await update.message.reply_text("اختر أمراً من القائمة أو اكتب /start.", reply_markup=main_menu())
 
 def main():
-    token = os.environ.get("BOT_TOKEN")
-
-    if not token:
-        raise RuntimeError("BOT_TOKEN is missing")
-
-    start_server()
-
-    app = (
-        ApplicationBuilder()
-        .token(token)
-        .post_init(post_init)
-        .build()
-    )
-
+    init_db()
+    Thread(target=run_health_server, daemon=True).start()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("game", game))
-    app.add_handler(CommandHandler("guess", guess_command))
-    app.add_handler(CommandHandler("stopgame", stopgame))
-    app.add_handler(CallbackQueryHandler(handle_invitation))
-    app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)
-    )
-
-    print("Bot is running...")
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+    log.info("GUESS ARENA bot started")
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()
