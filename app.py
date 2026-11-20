@@ -62,7 +62,8 @@ def init_db():
                 last_daily BIGINT NOT NULL DEFAULT 0,
                 is_banned BOOLEAN NOT NULL DEFAULT FALSE,
                 created_at BIGINT NOT NULL
-            )""")
+            )""") 
+            cur.execute("ALTER TABLE players ADD COLUMN IF NOT EXISTS display_name TEXT")
             cur.execute("""
             CREATE TABLE IF NOT EXISTS teams(
                 id BIGSERIAL PRIMARY KEY,
