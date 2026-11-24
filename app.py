@@ -6,11 +6,12 @@ import secrets
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from telegram import Update, ReplyKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -220,15 +221,269 @@ def is_admin(tg_id):
 
 def menu(tg_id):
     rows = [
-        ["🎮 العب", "👤 الملف الشخصي"],
-        ["👥 الفرق", "🏆 البطولات"],
-        ["🛒 المتجر", "🎒 مخزني"],
-        ["📊 التصنيف", "🎁 الدخول اليومي"],
-        ["👫 الأصدقاء", "📅 الموسم"],
+        [InlineKeyboardButton("🎮 العب", callback_data="m:play"), InlineKeyboardButton("👤 الملف الشخصي", callback_data="m:profile")],
+        [InlineKeyboardButton("👥 الفرق", callback_data="m:teams"), InlineKeyboardButton("🏆 البطولات", callback_data="m:tournaments")],
+        [InlineKeyboardButton("🛒 المتجر", callback_data="m:shop"), InlineKeyboardButton("🎒 مخزني", callback_data="m:inventory")],
+        [InlineKeyboardButton("📊 التصنيف", callback_data="m:rank"), InlineKeyboardButton("🎁 الدخول اليومي", callback_data="m:daily")],
+        [InlineKeyboardButton("👫 الأصدقاء", callback_data="m:friends"), InlineKeyboardButton("📅 الموسم", callback_data="m:season")],
     ]
     if is_admin(tg_id):
-        rows.append(["🛠 لوحة الأدمن"])
-    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+        rows.append([InlineKeyboardButton("🛠 لوحة الأدمن", callback_data="m:admin")])
+    return InlineKeyboardMarkup(rows)
+
+
+def back():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ القائمة الرئيسية", callback_data="m:home")]])
+
+
+async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid, data = q.from_user.id, q.data
+    p = player(uid)
+    if p and p.get("is_banned", False):
+        await q.edit_message_text("هذا الحساب موقوف حالياً.")
+        return
+
+    if data == "m:home":
+        context.user_data.pop("game", None)
+        await q.edit_message_text("🏟️ GUESS ARENA 👑\\nاختر من الأزرار:", reply_markup=menu(uid))
+        return
+
+    if data.startswith("m:"):
+        action = data[2:]
+        if action == "play":
+            context.user_data["game"] = {"number": random.randint(1, 150), "attempt": 0, "page": 0}
+            await render_guess(q, context, 0)
+            return
+        if action == "profile":
+            p = player(uid)
+            with connect() as con:
+                with con.cursor() as cur:
+                    cur.execute("SELECT t.name FROM team_members tm JOIN teams t ON t.id=tm.team_id WHERE tm.player_id=%s", (uid,))
+                    team = cur.fetchone()
+            level = max(1, p["xp"] // 500 + 1)
+            await q.edit_message_text(
+                f"👤 الملف الشخصي\\nالاسم: {p['display_name'] or 'لاعب'}\\nالنقاط: {p['points']}\\nXP: {p['xp']}\\nالمستوى: {level}\\nالانتصارات: {p['wins']}\\nالخسائر: {p['losses']}\\nالفريق: {team['name'] if team else 'بدون فريق'}",
+                reply_markup=back())
+            return
+        if action == "rank":
+            with connect() as con:
+                with con.cursor() as cur:
+                    cur.execute("SELECT display_name,username,points FROM players WHERE is_banned=FALSE ORDER BY points DESC,wins DESC LIMIT 10")
+                    rows=cur.fetchall()
+            body="📊 أفضل 10 لاعبين:\\n"+("\\n".join(f"{i}. {r['display_name'] or r['username'] or 'لاعب'} — {r['points']} نقطة" for i,r in enumerate(rows,1)) if rows else "لا يوجد لاعبون بعد.")
+            await q.edit_message_text(body, reply_markup=back()); return
+        if action == "daily":
+            now=int(time.time())
+            with connect() as con:
+                with con.cursor() as cur:
+                    cur.execute("SELECT last_daily FROM players WHERE telegram_id=%s FOR UPDATE",(uid,))
+                    row=cur.fetchone()
+                    if not row: body="ابدأ أولاً بـ /start."
+                    elif now-row["last_daily"]<86400: body=f"🎁 ارجع بعد {max(1,(86400-(now-row['last_daily']))//3600)} ساعة تقريباً."
+                    else:
+                        cur.execute("UPDATE players SET xp=xp+20,last_daily=%s WHERE telegram_id=%s",(now,uid)); body="🎁 حصلت على 20 XP!"
+            await q.edit_message_text(body,reply_markup=back()); return
+        if action == "teams":
+            await q.edit_message_text("👥 نظام الفرق",reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✨ إنشاء فريق باسم جاهز",callback_data="team:create")],
+                [InlineKeyboardButton("🤝 الانضمام لفريق",callback_data="team:list")],
+                [InlineKeyboardButton("⬅️ القائمة",callback_data="m:home")]])); return
+        if action == "tournaments":
+            with connect() as con:
+                with con.cursor() as cur:
+                    cur.execute("SELECT id,title,prize_points FROM tournaments WHERE status='open' ORDER BY created_at DESC LIMIT 15")
+                    rows=cur.fetchall()
+            buttons=[[InlineKeyboardButton(f"🏆 {r['title']} · {r['prize_points']} نقطة",callback_data=f"tournament:{r['id']}")] for r in rows]
+            buttons.append([InlineKeyboardButton("⬅️ القائمة",callback_data="m:home")])
+            await q.edit_message_text("اختر بطولة للتسجيل:" if rows else "لا توجد بطولات مفتوحة.",reply_markup=InlineKeyboardMarkup(buttons)); return
+        if action == "shop":
+            with connect() as con:
+                with con.cursor() as cur:
+                    cur.execute("SELECT id,title,price FROM shop_items WHERE active=TRUE ORDER BY price")
+                    rows=cur.fetchall()
+            buttons=[[InlineKeyboardButton(f"🛒 {r['title']} — {r['price']} نقطة",callback_data=f"buy:{r['id']}")] for r in rows]
+            buttons.append([InlineKeyboardButton("⬅️ القائمة",callback_data="m:home")])
+            await q.edit_message_text("اختر عنصراً للشراء:",reply_markup=InlineKeyboardMarkup(buttons)); return
+        if action == "inventory":
+            with connect() as con:
+                with con.cursor() as cur:
+                    cur.execute("""SELECT s.title,i.remaining_uses FROM inventory i JOIN shop_items s ON s.id=i.item_id
+                    WHERE i.player_id=%s AND (i.remaining_uses IS NULL OR i.remaining_uses>0)
+                    AND (i.expires_at IS NULL OR i.expires_at>%s) ORDER BY i.purchased_at DESC""",(uid,int(time.time())))
+                    rows=cur.fetchall()
+            body="🎒 مخزني:\\n"+"\\n".join(f"• {r['title']} — {r['remaining_uses'] if r['remaining_uses'] is not None else 'بانتظار التفعيل'}" for r in rows) if rows else "مخزونك فارغ."
+            await q.edit_message_text(body,reply_markup=back()); return
+        if action == "season":
+            with connect() as con:
+                with con.cursor() as cur:
+                    cur.execute("SELECT title FROM seasons WHERE status='active' ORDER BY starts_at DESC LIMIT 1")
+                    season_row=cur.fetchone()
+                    cur.execute("SELECT name,season_points FROM teams ORDER BY season_points DESC LIMIT 10")
+                    teams=cur.fetchall()
+            body=("📅 "+season_row["title"]+"\\n"+"\\n".join(f"{i}. {t['name']} — {t['season_points']}" for i,t in enumerate(teams,1))) if season_row else "لا يوجد موسم نشط حالياً."
+            await q.edit_message_text(body,reply_markup=back()); return
+        if action == "friends":
+            await q.edit_message_text("👫 نظام الأصدقاء والتحديات قيد التطوير.",reply_markup=back()); return
+        if action == "admin":
+            if not is_admin(uid):
+                await q.edit_message_text("هذا القسم للإدارة فقط."); return
+            await q.edit_message_text("🛠 لوحة الأدمن",reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📊 الإحصائيات",callback_data="admin:stats")],
+                [InlineKeyboardButton("🏁 إنهاء الموسم",callback_data="admin:end")],
+                [InlineKeyboardButton("⬅️ القائمة",callback_data="m:home")]])); return
+
+    if data.startswith("guesspage:"):
+        await render_guess(q,context,int(data.split(":")[1])); return
+    if data.startswith("guess:"):
+        game=context.user_data.get("game")
+        if not game:
+            await q.edit_message_text("لا توجد جولة نشطة.",reply_markup=back()); return
+        guess=int(data.split(":")[1]); game["attempt"]+=1; n=game["attempt"]
+        if guess==game["number"]:
+            pts=[10,8,6,4,2,1][n-1]; xp=[100,85,70,60,50,40][n-1]
+            with connect() as con:
+                with con.cursor() as cur:
+                    cur.execute("UPDATE players SET points=points+%s,xp=xp+%s,wins=wins+1 WHERE telegram_id=%s",(pts,xp,uid))
+            context.user_data.pop("game",None)
+            await q.edit_message_text(f"🎉 صحيح! ربحت {pts} نقطة و{xp} XP.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎮 جولة جديدة",callback_data="m:play")],[InlineKeyboardButton("القائمة",callback_data="m:home")]])); return
+        if n>=6:
+            answer=game["number"]; context.user_data.pop("game",None)
+            with connect() as con:
+                with con.cursor() as cur:
+                    cur.execute("UPDATE players SET losses=losses+1 WHERE telegram_id=%s",(uid,))
+            await q.edit_message_text(f"انتهت المحاولات. الرقم كان {answer}.",reply_markup=back()); return
+        hint="أكبر 🔼" if guess<game["number"] else "أصغر 🔽"
+        await render_guess(q,context,game.get("page",0),f"{hint} — باقي {6-n} محاولات."); return
+
+    if data == "game:cancel":
+        context.user_data.pop("game",None)
+        await q.edit_message_text("تم إنهاء الجولة.",reply_markup=back()); return
+
+    if data == "team:create":
+        names=["Shadow Wolves","Neon Kings","Royal Titans","Dark Phoenix","Cyber Knights","Golden Hawks","Night Raiders","Purple Storm"]
+        with connect() as con:
+            with con.cursor() as cur:
+                cur.execute("SELECT 1 FROM team_members WHERE player_id=%s",(uid,))
+                if cur.fetchone():
+                    await q.edit_message_text("أنت منضم لفريق بالفعل.",reply_markup=back()); return
+                chosen=None
+                for name in names:
+                    cur.execute("SELECT 1 FROM teams WHERE name=%s",(name,))
+                    if not cur.fetchone(): chosen=name; break
+                if not chosen: chosen="Shadow "+secrets.token_hex(2).upper()
+                code=secrets.token_urlsafe(5).replace("-","").replace("_","")[:8].upper()
+                cur.execute("INSERT INTO teams(name,invite_code,leader_id,created_at) VALUES(%s,%s,%s,%s) RETURNING id",(chosen,code,uid,int(time.time())))
+                tid=cur.fetchone()["id"]
+                cur.execute("INSERT INTO team_members(team_id,player_id,role,joined_at) VALUES(%s,%s,'leader',%s)",(tid,uid,int(time.time())))
+        await q.edit_message_text(f"تم إنشاء فريق {chosen} 👑\\nرمز الدعوة: {code}",reply_markup=back()); return
+
+    if data == "team:list":
+        with connect() as con:
+            with con.cursor() as cur:
+                cur.execute("SELECT 1 FROM team_members WHERE player_id=%s",(uid,)); member=cur.fetchone()
+                cur.execute("""SELECT t.id,t.name,COUNT(tm.player_id) AS n FROM teams t LEFT JOIN team_members tm ON tm.team_id=t.id GROUP BY t.id ORDER BY t.created_at DESC LIMIT 15""")
+                teams=cur.fetchall()
+        if member:
+            await q.edit_message_text("أنت منضم لفريق بالفعل.",reply_markup=back()); return
+        buttons=[[InlineKeyboardButton(f"{t['name']} ({t['n']}/4)",callback_data=f"teamjoin:{t['id']}")] for t in teams if t["n"]<4]
+        buttons.append([InlineKeyboardButton("⬅️ رجوع",callback_data="m:teams")])
+        await q.edit_message_text("اختر فريقاً:" if len(buttons)>1 else "لا توجد فرق متاحة.",reply_markup=InlineKeyboardMarkup(buttons)); return
+
+    if data.startswith("teamjoin:"):
+        tid=int(data.split(":")[1])
+        with connect() as con:
+            with con.cursor() as cur:
+                cur.execute("SELECT 1 FROM team_members WHERE player_id=%s",(uid,))
+                if cur.fetchone():
+                    await q.edit_message_text("أنت منضم لفريق بالفعل.",reply_markup=back()); return
+                cur.execute("SELECT name FROM teams WHERE id=%s",(tid,)); t=cur.fetchone()
+                cur.execute("SELECT COUNT(*) AS n FROM team_members WHERE team_id=%s",(tid,)); count=cur.fetchone()["n"]
+                if not t or count>=4:
+                    await q.edit_message_text("الفريق غير متاح أو مكتمل.",reply_markup=back()); return
+                cur.execute("INSERT INTO team_members(team_id,player_id,role,joined_at) VALUES(%s,%s,'member',%s)",(tid,uid,int(time.time())))
+        await q.edit_message_text(f"انضممت إلى {t['name']} ✅",reply_markup=back()); return
+
+    if data.startswith("tournament:"):
+        tid=int(data.split(":")[1])
+        with connect() as con:
+            with con.cursor() as cur:
+                cur.execute("SELECT * FROM tournaments WHERE id=%s AND status='open' FOR UPDATE",(tid,)); t=cur.fetchone()
+                if not t:
+                    await q.edit_message_text("البطولة غير متاحة.",reply_markup=back()); return
+                cur.execute("SELECT COUNT(*) AS n FROM tournament_entries WHERE tournament_id=%s",(tid,)); count=cur.fetchone()["n"]
+                cur.execute("SELECT 1 FROM tournament_entries WHERE tournament_id=%s AND player_id=%s",(tid,uid)); joined=cur.fetchone()
+                if joined:
+                    await q.edit_message_text("أنت مسجل مسبقاً.",reply_markup=back()); return
+                if count>=t["max_players"]:
+                    await q.edit_message_text("اكتمل عدد المشاركين.",reply_markup=back()); return
+                cur.execute("INSERT INTO tournament_entries(tournament_id,player_id,joined_at) VALUES(%s,%s,%s)",(tid,uid,int(time.time())))
+        await q.edit_message_text(f"تم تسجيلك في {t['title']} 🏆",reply_markup=back()); return
+
+    if data.startswith("buy:"):
+        iid=int(data.split(":")[1])
+        with connect() as con:
+            with con.cursor() as cur:
+                cur.execute("SELECT * FROM shop_items WHERE id=%s AND active=TRUE",(iid,)); item=cur.fetchone()
+                cur.execute("SELECT points FROM players WHERE telegram_id=%s FOR UPDATE",(uid,)); p=cur.fetchone()
+                if not item:
+                    await q.edit_message_text("العنصر غير موجود.",reply_markup=back()); return
+                if not p or p["points"]<item["price"]:
+                    await q.edit_message_text("نقاطك لا تكفي.",reply_markup=back()); return
+                cur.execute("UPDATE players SET points=points-%s WHERE telegram_id=%s",(item["price"],uid))
+                cur.execute("INSERT INTO inventory(player_id,item_id,remaining_uses,expires_at,purchased_at) VALUES(%s,%s,%s,NULL,%s)",(uid,iid,item["uses"],int(time.time())))
+        await q.edit_message_text(f"تم شراء {item['title']} وإضافته للمخزون. مدة العناصر المؤقتة لا تبدأ إلا عند التفعيل.",reply_markup=back()); return
+
+    if data == "admin:stats":
+        if not is_admin(uid):
+            await q.edit_message_text("للإدارة فقط."); return
+        with connect() as con:
+            with con.cursor() as cur:
+                counts=[]
+                for table in ("players","teams","tournaments"):
+                    cur.execute(f"SELECT COUNT(*) AS n FROM {table}"); counts.append(cur.fetchone()["n"])
+        await q.edit_message_text(f"📊 اللاعبين: {counts[0]}\\nالفرق: {counts[1]}\\nالبطولات: {counts[2]}",reply_markup=back()); return
+
+    if data == "admin:end":
+        if not is_admin(uid):
+            await q.edit_message_text("للإدارة فقط."); return
+        now=int(time.time())
+        with connect() as con:
+            with con.cursor() as cur:
+                cur.execute("SELECT id FROM seasons WHERE status='active' ORDER BY starts_at DESC LIMIT 1 FOR UPDATE")
+                season_row=cur.fetchone()
+                if not season_row:
+                    await q.edit_message_text("لا يوجد موسم نشط.",reply_markup=back()); return
+                sid=season_row["id"]
+                cur.execute("""WITH added AS (
+                    INSERT INTO season_deductions(season_id,player_id,deducted_points)
+                    SELECT %s,telegram_id,FLOOR(points*0.20)::int FROM players
+                    ON CONFLICT(season_id,player_id) DO NOTHING RETURNING player_id,deducted_points)
+                    UPDATE players p SET points=GREATEST(0,p.points-a.deducted_points)
+                    FROM added a WHERE p.telegram_id=a.player_id""",(sid,))
+                cur.execute("UPDATE seasons SET status='ended',ends_at=%s WHERE id=%s",(now,sid))
+        await q.edit_message_text("انتهى الموسم وتم تطبيق الخصم مرة واحدة.",reply_markup=back()); return
+
+
+async def render_guess(q, context, page=0, notice=None):
+    game=context.user_data.get("game")
+    if not game:
+        await q.edit_message_text("لا توجد جولة نشطة.",reply_markup=back()); return
+    page=max(0,min(9,page)); game["page"]=page
+    first=page*15+1
+    rows=[]
+    for offset in range(0,15,3):
+        rows.append([InlineKeyboardButton(str(n),callback_data=f"guess:{n}") for n in range(first+offset,first+offset+3)])
+    nav=[]
+    if page: nav.append(InlineKeyboardButton("◀️",callback_data=f"guesspage:{page-1}"))
+    nav.append(InlineKeyboardButton(f"{page+1}/10",callback_data="noop"))
+    if page<9: nav.append(InlineKeyboardButton("▶️",callback_data=f"guesspage:{page+1}"))
+    rows.append(nav)
+    rows.append([InlineKeyboardButton("❌ إنهاء الجولة",callback_data="game:cancel"),InlineKeyboardButton("القائمة",callback_data="m:home")])
+    text=f"🎮 اختر رقماً من 1 إلى 150\\nالمحاولات: {game['attempt']}/6"
+    if notice: text+="\\n"+notice
+    await q.edit_message_text(text,reply_markup=InlineKeyboardMarkup(rows))
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -244,7 +499,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🏟️ أهلاً بك في GUESS ARENA 👑\n"
         "CHALLENGE • GUESS • WIN\n"
-        "اختر من القائمة:",
+        "اختر من الأزرار:",
         reply_markup=menu(update.effective_user.id),
     )
 
@@ -936,6 +1191,7 @@ def main():
     app.add_handler(CommandHandler("admin_unban", admin_unban))
     app.add_handler(CommandHandler("admin_season", admin_season))
     app.add_handler(CommandHandler("admin_end_season", admin_end_season))
+    app.add_handler(CallbackQueryHandler(callback_router))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)
     )
