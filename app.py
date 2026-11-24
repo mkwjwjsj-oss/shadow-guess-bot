@@ -1271,18 +1271,19 @@ async def error_handler(update, context):
 
 
 def main():
-    init_db()
+    # Bind Render's HTTP port first so the Web Service becomes healthy
+    # even while the database connection is being initialized.
+    log.info("Starting GUESS ARENA process")
     start_health_server()
+    log.info("Health server is listening on port %s", os.getenv("PORT", "10000"))
+
+    log.info("Initializing PostgreSQL database")
+    init_db()
+    log.info("PostgreSQL initialization completed")
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("myid", myid))
     app.add_handler(CommandHandler("join_tournament", join_tournament))
     app.add_handler(CommandHandler("buy", buy))
-    app.add_handler(CommandHandler("admin", admin_panel))
-    app.add_handler(CommandHandler("admin_stats", admin_stats))
-    app.add_handler(CommandHandler("admin_create_tournament", admin_create_tournament))
-    app.add_handler(CommandHandler("admin_points", admin_points))
-    app.add_handler(CommandHandler("admin_ban", admin_ban))
-    app.add_handler(CommandHandler("admin_unban", admin_unban))
- 
+    app.add_handler(CommandHandler("ad
