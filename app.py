@@ -1,4 +1,4 @@
-# GUESS ARENA build: 2026-11-24-fix-joined-check
+# GUESS ARENA build: 2026-11-24-friend-challenges-fix-2
 import os
 import time
 import random
@@ -206,6 +206,19 @@ def init_db():
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_friend_challenges_players
                 ON friend_challenges(challenger_id, opponent_id, status)
+            """)
+            # Safe in-place migration for older installations; existing challenges are preserved.
+            for statement in (
+                "ALTER TABLE friend_challenges ADD COLUMN IF NOT EXISTS current_turn BIGINT",
+                "ALTER TABLE friend_challenges ADD COLUMN IF NOT EXISTS challenger_attempts INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE friend_challenges ADD COLUMN IF NOT EXISTS opponent_attempts INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE friend_challenges ADD COLUMN IF NOT EXISTS finished_at BIGINT",
+            ):
+                cur.execute(statement)
+            cur.execute("""
+                UPDATE friend_challenges
+                SET current_turn = challenger_id
+                WHERE status='active' AND current_turn IS NULL
             """)
             cur.execute("""
                 INSERT INTO shop_items(code, title, price, duration_hours, uses)
@@ -729,7 +742,10 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 buttons.append([InlineKeyboardButton(f"⚔️ تحدي {label[:24]}", callback_data=f"friend:challenge:{person['telegram_id']}")])
             buttons.append([InlineKeyboardButton("📨 طلباتي وتحدياتي", callback_data="friends:pending")])
             buttons.append([InlineKeyboardButton("⬅️ القائمة الرئيسية", callback_data="m:home")])
-            await q.edit_message_text("👫 **تحدي الأصدقاء**\nاختر لاعباً لإرسال تحدي تخمين خاص إليه. أول لاعب يخمن الرقم يفوز.", reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
+            intro = "👫 تحدي الأصدقاء\nاختر لاعباً لإرسال تحدي تخمين خاص إليه. أول لاعب يخمن الرقم يفوز.\nلكل لاعب 6 محاولات بالتناوب."
+            if not candidates:
+                intro += "\n\nلا يوجد لاعبون آخرون مسجلون حالياً. اطلب من صديقك فتح البوت وإرسال /start أولاً."
+            await q.edit_message_text(intro, reply_markup=InlineKeyboardMarkup(buttons))
             return
         if action == "admin":
             if not is_admin(uid):
@@ -742,7 +758,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with connect() as con:
             with con.cursor() as cur:
                 cur.execute("""
-                    SELECT id, challenger_id, opponent_id, status
+                    SELECT id, challenger_id, opponent_id, status, current_turn,
+                           challenger_attempts, opponent_attempts
                     FROM friend_challenges
                     WHERE (challenger_id=%s OR opponent_id=%s)
                       AND status IN ('pending','active')
@@ -761,7 +778,10 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             elif r['status'] == 'pending':
                 lines.append(f"بانتظار رد {name} على تحديك")
             else:
-                lines.append(f"مباراة نشطة ضد {name} — الدور: {'أنت' if r['current_turn']==uid else name}")
+                mine = r['challenger_attempts'] if r['challenger_id'] == uid else r['opponent_attempts']
+                theirs = r['opponent_attempts'] if r['challenger_id'] == uid else r['challenger_attempts']
+                turn_name = "أنت" if r['current_turn'] == uid else name
+                lines.append(f"مباراة نشطة ضد {name} — الدور: {turn_name}\nمحاولاتك: {mine}/6 | محاولات الخصم: {theirs}/6")
         buttons.append([InlineKeyboardButton("⬅️ رجوع للأصدقاء", callback_data="m:friends")])
         await q.edit_message_text("\n".join(lines) if rows else "لا توجد طلبات أو تحديات نشطة.", reply_markup=InlineKeyboardMarkup(buttons))
         return
@@ -1039,31 +1059,4 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return
                 cur.execute("SELECT name FROM teams WHERE id=%s", (tid,))
                 team = cur.fetchone()
-                cur.execute("SELECT COUNT(*) AS n FROM team_members WHERE team_id=%s", (tid,))
-                count = cur.fetchone()["n"]
-                if not team or count >= 4:
-                    await q.edit_message_text("الفريق غير متاح أو مكتمل.", reply_markup=back())
-                    return
-                cur.execute("""
-                    INSERT INTO team_members(team_id,player_id,role,joined_at)
-                    VALUES(%s,%s,'member',%s)
-                """, (tid, uid, int(time.time())))
-        await q.edit_message_text(f"انضممت إلى {team['name']} ✅", reply_markup=back())
-        return
-
-    if data.startswith("tournament:"):
-        tid = int(data.split(":")[1])
-        with connect() as con:
-            with con.cursor() as cur:
-                cur.execute("SELECT * FROM tournaments WHERE id=%s AND status='open' FOR UPDATE", (tid,))
-                t = cur.fetchone()
-                if not t:
-                    await q.edit_message_text("البطولة غير متاحة.", reply_markup=back())
-                    return
-                cur.execute("SELECT COUNT(*) AS n FROM tournament_entries WHERE tournament_id=%s", (tid,))
-                count = cur.fetchone()["n"]
-                cur.execute(
-                    "SELECT 1 FROM tournament_entries WHERE tournament_id=%s AND player_id=%s",
-                    (tid, uid)
-                )
-                j
+                cur
