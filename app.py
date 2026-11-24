@@ -1150,7 +1150,23 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with connect() as con:
             with con.cursor() as cur:
                 cur.execute("SELECT last_daily FROM players WHERE telegram_id=%s FOR UPDATE", (uid,))
-                row = cur.fetchone()
+                                row = cur.fetchone()
+                if row and now - (row["last_daily"] or 0) < 86400:
+                    await update.message.reply_text(
+                        "🎁 استلمت مكافأة الدخول اليومي بالفعل. ارجع بعد 24 ساعة."
+                    )
+                    return
+
+                daily_reward = 50
+                cur.execute(
+                    "UPDATE players SET points = points + %s, last_daily = %s WHERE telegram_id = %s",
+                    (daily_reward, now, uid)
+                )
+
+        await update.message.reply_text(
+            f"🎁 حصلت على {daily_reward} نقطة للدخول اليومي!"
+        )
+        return
                                 if row and now - (row["last_daily"] or 0) < 86400:
                     await update.message.reply_text(
                         "🎁 استلمت مكافأة الدخول اليومي بالفعل. ارجع بعد 24 ساعة."
