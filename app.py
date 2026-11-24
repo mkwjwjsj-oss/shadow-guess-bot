@@ -1065,5 +1065,11 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "SELECT 1 FROM tournament_entries WHERE tournament_id=%s AND player_id=%s",
                     (tid, uid)
                 )
-                joined = cur.fetchone()
+                                joined = cur.fetchone()
+                if joined is not None:
+                    await q.edit_message_text(
+                        "أنت مسجل مسبقاً.",
+                        reply_markup=back(),
+                    )
+                    return
                                 if joined is not None: 
