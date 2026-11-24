@@ -189,6 +189,24 @@ def init_db():
                 ON match_history(player_id, played_at DESC)
             """)
             cur.execute("""
+                CREATE TABLE IF NOT EXISTS friend_challenges (
+                    id BIGSERIAL PRIMARY KEY,
+                    challenger_id BIGINT NOT NULL REFERENCES players(telegram_id),
+                    opponent_id BIGINT NOT NULL REFERENCES players(telegram_id),
+                    secret_number INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    current_turn BIGINT,
+                    challenger_attempts INTEGER NOT NULL DEFAULT 0,
+                    opponent_attempts INTEGER NOT NULL DEFAULT 0,
+                    created_at BIGINT NOT NULL,
+                    finished_at BIGINT
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_friend_challenges_players
+                ON friend_challenges(challenger_id, opponent_id, status)
+            """)
+            cur.execute("""
                 INSERT INTO shop_items(code, title, price, duration_hours, uses)
                 VALUES
                     ('POINTS_X2', 'مضاعفة النقاط', 75, 24, NULL),
@@ -340,6 +358,23 @@ async def render_guess(q, context, page=0, notice=None):
     if notice:
         body += "\n" + notice
     await q.edit_message_text(body, reply_markup=InlineKeyboardMarkup(rows))
+
+
+def friend_guess_keyboard(challenge_id, page=0):
+    page = max(0, min(2, page))
+    first = page * 50 + 1
+    rows = []
+    for offset in range(0, 50, 5):
+        rows.append([InlineKeyboardButton(str(n), callback_data=f"fcg:{challenge_id}:{n}")
+                     for n in range(first + offset, min(first + offset + 5, first + 50))])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀️", callback_data=f"fcpage:{challenge_id}:{page-1}"))
+    nav.append(InlineKeyboardButton(f"{page+1}/3", callback_data="noop"))
+    if page < 2:
+        nav.append(InlineKeyboardButton("▶️", callback_data=f"fcpage:{challenge_id}:{page+1}"))
+    rows.append(nav)
+    return InlineKeyboardMarkup(rows)
 
 
 async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -668,7 +703,32 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text(body, reply_markup=back())
             return
         if action == "friends":
-            await q.edit_message_text("👫 نظام الأصدقاء والتحديات قيد التطوير.", reply_markup=back())
+            with connect() as con:
+                with con.cursor() as cur:
+                    cur.execute("""
+                        SELECT id, challenger_id, opponent_id, status
+                        FROM friend_challenges
+                        WHERE (challenger_id=%s OR opponent_id=%s)
+                          AND status IN ('pending','active')
+                        ORDER BY created_at DESC LIMIT 10
+                    """, (uid, uid))
+                    active_challenges = cur.fetchall()
+                    cur.execute("""
+                        SELECT telegram_id, display_name, username
+                        FROM players
+                        WHERE telegram_id<>%s AND is_banned=FALSE
+                        ORDER BY created_at DESC LIMIT 20
+                    """, (uid,))
+                    candidates = cur.fetchall()
+            buttons = []
+            if active_challenges:
+                buttons.append([InlineKeyboardButton("📨 تحدياتك الحالية", callback_data="friends:pending")])
+            for person in candidates:
+                label = person['display_name'] or ("@" + person['username'] if person['username'] else str(person['telegram_id']))
+                buttons.append([InlineKeyboardButton(f"⚔️ تحدي {label[:24]}", callback_data=f"friend:challenge:{person['telegram_id']}")])
+            buttons.append([InlineKeyboardButton("📨 طلباتي وتحدياتي", callback_data="friends:pending")])
+            buttons.append([InlineKeyboardButton("⬅️ القائمة الرئيسية", callback_data="m:home")])
+            await q.edit_message_text("👫 **تحدي الأصدقاء**\nاختر لاعباً لإرسال تحدي تخمين خاص إليه. أول لاعب يخمن الرقم يفوز.", reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
             return
         if action == "admin":
             if not is_admin(uid):
@@ -676,6 +736,189 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             await q.edit_message_text("🛠 لوحة الأدمن", reply_markup=admin_keyboard())
             return
+
+    if data == "friends:pending":
+        with connect() as con:
+            with con.cursor() as cur:
+                cur.execute("""
+                    SELECT id, challenger_id, opponent_id, status
+                    FROM friend_challenges
+                    WHERE (challenger_id=%s OR opponent_id=%s)
+                      AND status IN ('pending','active')
+                    ORDER BY created_at DESC LIMIT 15
+                """, (uid, uid))
+                rows = cur.fetchall()
+        buttons = []
+        lines = ["📨 طلباتك وتحدياتك:"]
+        for r in rows:
+            other = r['opponent_id'] if r['challenger_id'] == uid else r['challenger_id']
+            other_p = player(other)
+            name = (other_p['display_name'] or other_p['username'] or str(other)) if other_p else str(other)
+            if r['status'] == 'pending' and r['opponent_id'] == uid:
+                lines.append(f"طلب تحدي من {name}")
+                buttons.append([InlineKeyboardButton(f"✅ قبول {name[:18]}", callback_data=f"friend:accept:{r['id']}"), InlineKeyboardButton("❌ رفض", callback_data=f"friend:reject:{r['id']}")])
+            elif r['status'] == 'pending':
+                lines.append(f"بانتظار رد {name} على تحديك")
+            else:
+                lines.append(f"مباراة نشطة ضد {name} — الدور: {'أنت' if r['current_turn']==uid else name}")
+        buttons.append([InlineKeyboardButton("⬅️ رجوع للأصدقاء", callback_data="m:friends")])
+        await q.edit_message_text("\n".join(lines) if rows else "لا توجد طلبات أو تحديات نشطة.", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if data.startswith("friend:challenge:"):
+        target = int(data.rsplit(":", 1)[1])
+        if target == uid:
+            await q.edit_message_text("ما بتقدر تتحدى نفسك.", reply_markup=back())
+            return
+        target_player = player(target)
+        if not target_player or target_player.get('is_banned'):
+            await q.edit_message_text("اللاعب غير موجود أو موقوف.", reply_markup=back())
+            return
+        with connect() as con:
+            with con.cursor() as cur:
+                cur.execute("""
+                    SELECT 1 FROM friend_challenges
+                    WHERE status IN ('pending','active')
+                      AND (challenger_id IN (%s,%s) OR opponent_id IN (%s,%s))
+                    LIMIT 1
+                """, (uid, target, uid, target))
+                busy = cur.fetchone()
+                if busy:
+                    await q.edit_message_text("أنت أو اللاعب الآخر لديكما تحدٍ معلّق أو مباراة نشطة بالفعل.", reply_markup=back())
+                    return
+                cur.execute("""
+                    INSERT INTO friend_challenges(challenger_id,opponent_id,secret_number,status,created_at)
+                    VALUES(%s,%s,%s,'pending',%s) RETURNING id
+                """, (uid, target, random.randint(1,150), int(time.time())))
+                challenge_id = cur.fetchone()['id']
+        challenger_name = q.from_user.full_name
+        try:
+            await context.bot.send_message(
+                chat_id=target,
+                text=f"⚔️ وصلك تحدي تخمين من {challenger_name}!\nالرقم بين 1 و150، ولكل لاعب 6 محاولات بالتناوب. أول من يصيب الرقم يفوز.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ قبول التحدي", callback_data=f"friend:accept:{challenge_id}"), InlineKeyboardButton("❌ رفض", callback_data=f"friend:reject:{challenge_id}")]])
+            )
+        except Exception:
+            with connect() as con:
+                with con.cursor() as cur:
+                    cur.execute("UPDATE friend_challenges SET status='cancelled',finished_at=%s WHERE id=%s", (int(time.time()), challenge_id))
+            await q.edit_message_text("ما قدرت أوصل الدعوة. لازم اللاعب يفتح البوت ويرسل /start أولاً.", reply_markup=back())
+            return
+        await q.edit_message_text("تم إرسال التحدي ✅\nبانتظار قبول اللاعب.", reply_markup=back())
+        return
+
+    if data.startswith("friend:reject:"):
+        challenge_id = int(data.rsplit(":", 1)[1])
+        with connect() as con:
+            with con.cursor() as cur:
+                cur.execute("""UPDATE friend_challenges SET status='rejected',finished_at=%s
+                               WHERE id=%s AND opponent_id=%s AND status='pending' RETURNING challenger_id""", (int(time.time()), challenge_id, uid))
+                row = cur.fetchone()
+        if row:
+            try:
+                await context.bot.send_message(row['challenger_id'], "تم رفض تحديك من اللاعب.")
+            except Exception:
+                pass
+            await q.edit_message_text("تم رفض التحدي.", reply_markup=back())
+        else:
+            await q.edit_message_text("الطلب غير متاح أو تمت معالجته.", reply_markup=back())
+        return
+
+    if data.startswith("friend:accept:"):
+        challenge_id = int(data.rsplit(":", 1)[1])
+        with connect() as con:
+            with con.cursor() as cur:
+                cur.execute("""UPDATE friend_challenges SET status='active',current_turn=challenger_id
+                               WHERE id=%s AND opponent_id=%s AND status='pending'
+                               RETURNING challenger_id,opponent_id""", (challenge_id, uid))
+                row = cur.fetchone()
+        if not row:
+            await q.edit_message_text("التحدي انتهى أو تمت معالجته مسبقاً.", reply_markup=back())
+            return
+        try:
+            await context.bot.send_message(row['challenger_id'], "✅ تم قبول تحديك! بدأت المباراة، دورك أولاً.")
+            await context.bot.send_message(row['challenger_id'], "🎯 دورك الآن: اختر تخمينك من 1 إلى 150.", reply_markup=friend_guess_keyboard(challenge_id, 0))
+            await context.bot.send_message(row['opponent_id'], "⚔️ بدأت المباراة! انتظر دور اللاعب الآخر.")
+        except Exception:
+            pass
+        await q.edit_message_text("قبلت التحدي! تم بدء المباراة، اللاعب الذي أرسل الدعوة يبدأ أولاً.", reply_markup=back())
+        return
+
+    if data.startswith("fcpage:"):
+        parts = data.split(":")
+        challenge_id, page = int(parts[1]), int(parts[2])
+        with connect() as con:
+            with con.cursor() as cur:
+                cur.execute("SELECT * FROM friend_challenges WHERE id=%s AND status='active'", (challenge_id,))
+                game = cur.fetchone()
+        if not game or game['current_turn'] != uid:
+            await q.edit_message_text("هذا ليس دورك أو أن المباراة انتهت.", reply_markup=back())
+            return
+        await q.edit_message_text(f"🎯 دورك في التحدي #{challenge_id}. اختر رقماً من 1 إلى 150.", reply_markup=friend_guess_keyboard(challenge_id, page))
+        return
+
+    if data.startswith("fcg:"):
+        _, challenge_raw, guess_raw = data.split(":")
+        challenge_id, guess = int(challenge_raw), int(guess_raw)
+        if not 1 <= guess <= 150:
+            return
+        with connect() as con:
+            with con.cursor() as cur:
+                cur.execute("SELECT * FROM friend_challenges WHERE id=%s FOR UPDATE", (challenge_id,))
+                game = cur.fetchone()
+                if not game or game['status'] != 'active' or game['current_turn'] != uid:
+                    await q.edit_message_text("هذا ليس دورك أو أن المباراة انتهت.", reply_markup=back())
+                    return
+                challenger = game['challenger_id']
+                opponent = game['opponent_id']
+                is_challenger = uid == challenger
+                col = 'challenger_attempts' if is_challenger else 'opponent_attempts'
+                attempts = game[col] + 1
+                cur.execute(f"UPDATE friend_challenges SET {col}=%s WHERE id=%s", (attempts, challenge_id))
+                if guess == game['secret_number']:
+                    winner = uid
+                    loser = opponent if uid == challenger else challenger
+                    now = int(time.time())
+                    cur.execute("UPDATE friend_challenges SET status='finished',finished_at=%s WHERE id=%s", (now, challenge_id))
+                    cur.execute("UPDATE players SET points=points+10,xp=xp+100,wins=wins+1 WHERE telegram_id=%s", (winner,))
+                    cur.execute("UPDATE players SET losses=losses+1 WHERE telegram_id=%s", (loser,))
+                    cur.execute("""INSERT INTO match_history(player_id,result,attempts,points_earned,xp_earned,played_at)
+                                   VALUES(%s,'win',%s,10,100,%s)""", (winner, attempts, now))
+                    cur.execute("""INSERT INTO match_history(player_id,result,attempts,points_earned,xp_earned,played_at)
+                                   VALUES(%s,'loss',%s,0,0,%s)""", (loser, game['opponent_attempts'] if is_challenger else game['challenger_attempts'], now))
+                    result = ('win', winner, loser, attempts)
+                elif attempts >= 6 and game['challenger_attempts'] + game['opponent_attempts'] + 1 >= 12:
+                    now = int(time.time())
+                    cur.execute("UPDATE friend_challenges SET status='draw',finished_at=%s WHERE id=%s", (now, challenge_id))
+                    result = ('draw', None, None, attempts)
+                else:
+                    next_turn = opponent if uid == challenger else challenger
+                    cur.execute("UPDATE friend_challenges SET current_turn=%s WHERE id=%s", (next_turn, challenge_id))
+                    result = ('continue', next_turn, None, attempts)
+        if result[0] == 'win':
+            await q.edit_message_text("🏆 صحيح! فزت بالتحدي وربحت 10 نقاط و100 XP!", reply_markup=back())
+            try:
+                await context.bot.send_message(result[2], "انتهت المباراة. خصمك خمّن الرقم وفاز عليك.", reply_markup=back())
+            except Exception:
+                pass
+            return
+        if result[0] == 'draw':
+            await q.edit_message_text("🤝 انتهت المباراة بالتعادل! لم يتم خصم أو إضافة نقاط.", reply_markup=back())
+            other = game['opponent_id'] if uid == game['challenger_id'] else game['challenger_id']
+            try:
+                await context.bot.send_message(other, "🤝 انتهت مباراتكما بالتعادل!", reply_markup=back())
+            except Exception:
+                pass
+            return
+        next_turn = result[1]
+        hint = "أكبر 🔼" if guess < game['secret_number'] else "أصغر 🔽"
+        try:
+            await context.bot.send_message(next_turn, f"دورك الآن في التحدي #{challenge_id}. تخمين الخصم: {hint}\nمحاولاتك: {game['challenger_attempts'] if next_turn == game['challenger_id'] else game['opponent_attempts']}/6", reply_markup=friend_guess_keyboard(challenge_id, 0))
+            await context.bot.send_message(uid, f"تخمينك: {guess}. {hint}\nتم تحويل الدور إلى خصمك.")
+        except Exception:
+            pass
+        await q.edit_message_text(f"تم تسجيل تخمينك: {guess}. {hint}\nبانتظار دور الخصم.", reply_markup=back())
+        return
 
     if data.startswith("guesspage:"):
         await render_guess(q, context, int(data.split(":")[1]))
@@ -824,362 +1067,3 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 joined = cur.fetchone()
                 if joined:
-                    await q.edit_message_text("أنت مسجل مسبقاً.", reply_markup=back())
-                    return
-                if count >= t["max_players"]:
-                    await q.edit_message_text("اكتمل عدد المشاركين.", reply_markup=back())
-                    return
-                cur.execute(
-                    "INSERT INTO tournament_entries(tournament_id,player_id,joined_at) VALUES(%s,%s,%s)",
-                    (tid, uid, int(time.time()))
-                )
-        await q.edit_message_text(f"تم تسجيلك في {t['title']} 🏆", reply_markup=back())
-        return
-
-    if data.startswith("buy:"):
-        iid = int(data.split(":")[1])
-        with connect() as con:
-            with con.cursor() as cur:
-                cur.execute("SELECT * FROM shop_items WHERE id=%s AND active=TRUE", (iid,))
-                item = cur.fetchone()
-                cur.execute("SELECT points FROM players WHERE telegram_id=%s FOR UPDATE", (uid,))
-                p = cur.fetchone()
-                if not item:
-                    await q.edit_message_text("العنصر غير موجود.", reply_markup=back())
-                    return
-                if not p or p["points"] < item["price"]:
-                    await q.edit_message_text("نقاطك لا تكفي.", reply_markup=back())
-                    return
-                cur.execute("UPDATE players SET points=points-%s WHERE telegram_id=%s", (item["price"], uid))
-                cur.execute("""
-                    INSERT INTO inventory(player_id,item_id,remaining_uses,expires_at,purchased_at)
-                    VALUES(%s,%s,%s,NULL,%s)
-                """, (uid, iid, item["uses"], int(time.time())))
-        await q.edit_message_text(
-            f"تم شراء {item['title']} وإضافته للمخزون. مدة العناصر المؤقتة لا تبدأ إلا عند التفعيل.",
-            reply_markup=back()
-        )
-        return
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    ensure_player(update.effective_user)
-    p = player(update.effective_user.id)
-    if not p:
-        await update.message.reply_text("تعذر تحميل ملف اللاعب. حاول مرة ثانية.")
-        return
-    if p.get("is_banned", False) and not is_admin(update.effective_user.id):
-        await update.message.reply_text("هذا الحساب موقوف حالياً.")
-        return
-    await update.message.reply_text(
-        "🏟️ أهلاً بك في GUESS ARENA 👑\nCHALLENGE • GUESS • WIN\nاختر من الأزرار:",
-        reply_markup=menu(update.effective_user.id)
-    )
-
-
-async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"معرّف تيليجرام الخاص بك: {update.effective_user.id}")
-
-
-async def admin_panel(update, context):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("هذا القسم مخصص للإدارة فقط.")
-        return
-    await update.message.reply_text("🛠 لوحة الأدمن", reply_markup=admin_keyboard())
-
-
-async def admin_stats(update, context):
-    if not is_admin(update.effective_user.id):
-        return
-    with connect() as con:
-        with con.cursor() as cur:
-            cur.execute("SELECT COUNT(*) AS n FROM players")
-            pc = cur.fetchone()["n"]
-            cur.execute("SELECT COUNT(*) AS n FROM teams")
-            tc = cur.fetchone()["n"]
-            cur.execute("SELECT COUNT(*) AS n FROM tournaments")
-            tourc = cur.fetchone()["n"]
-    await update.message.reply_text(f"📊 الإحصائيات\nاللاعبون: {pc}\nالفرق: {tc}\nالبطولات: {tourc}")
-
-
-async def admin_create_tournament(update, context):
-    if not is_admin(update.effective_user.id):
-        return
-    parts = " ".join(context.args).split("|")
-    if len(parts) < 4:
-        await update.message.reply_text("الصيغة: العنوان|الوصف|الجائزة|الحد_الأقصى")
-        return
-    title, desc = parts[0].strip(), parts[1].strip()
-    try:
-        prize, maxp = int(parts[2]), int(parts[3])
-    except ValueError:
-        await update.message.reply_text("الجائزة والحد الأقصى يجب أن يكونا أرقاماً.")
-        return
-    if not title or prize < 0 or maxp < 2:
-        await update.message.reply_text("تحقق من العنوان والجائزة والحد الأقصى.")
-        return
-    with connect() as con:
-        with con.cursor() as cur:
-            cur.execute("""
-                INSERT INTO tournaments(title,description,prize_points,max_players,created_by,created_at)
-                VALUES(%s,%s,%s,%s,%s,%s) RETURNING id
-            """, (title, desc, prize, maxp, update.effective_user.id, int(time.time())))
-            tid = cur.fetchone()["id"]
-    await update.message.reply_text(f"تم إنشاء البطولة #{tid} وفتح التسجيل ✅")
-
-
-async def admin_points(update, context):
-    if not is_admin(update.effective_user.id):
-        return
-    if len(context.args) != 2:
-        await update.message.reply_text("الصيغة: /admin_points Telegram_ID مقدار_النقاط")
-        return
-    try:
-        target_id, amount = int(context.args[0]), int(context.args[1])
-    except ValueError:
-        await update.message.reply_text("تأكد من الأرقام.")
-        return
-    with connect() as con:
-        with con.cursor() as cur:
-            cur.execute("""
-                UPDATE players SET points=GREATEST(0,points+%s)
-                WHERE telegram_id=%s RETURNING points
-            """, (amount, target_id))
-            row = cur.fetchone()
-    await update.message.reply_text(
-        f"تم التعديل. الرصيد الحالي: {row['points']}" if row else "اللاعب غير موجود."
-    )
-
-
-async def admin_ban_common(update, context, banned):
-    if not is_admin(update.effective_user.id):
-        return
-    if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text("اكتب Telegram_ID بعد الأمر.")
-        return
-    with connect() as con:
-        with con.cursor() as cur:
-            cur.execute("""
-                UPDATE players SET is_banned=%s WHERE telegram_id=%s RETURNING telegram_id
-            """, (banned, int(context.args[0])))
-            row = cur.fetchone()
-    await update.message.reply_text("تم تحديث حالة اللاعب." if row else "اللاعب غير موجود.")
-
-
-async def admin_ban(update, context):
-    await admin_ban_common(update, context, True)
-
-
-async def admin_unban(update, context):
-    await admin_ban_common(update, context, False)
-
-
-async def admin_season(update, context):
-    if not is_admin(update.effective_user.id):
-        return
-    parts = " ".join(context.args).split("|")
-    if len(parts) != 2:
-        await update.message.reply_text("الصيغة: /admin_season عنوان|عدد_أيام")
-        return
-    try:
-        days = int(parts[1])
-    except ValueError:
-        await update.message.reply_text("عدد الأيام يجب أن يكون رقماً.")
-        return
-    if days < 1 or not parts[0].strip():
-        await update.message.reply_text("أدخل عنواناً وعدداً صحيحاً للأيام.")
-        return
-    now = int(time.time())
-    with connect() as con:
-        with con.cursor() as cur:
-            cur.execute("UPDATE seasons SET status='ended' WHERE status='active'")
-            cur.execute("""
-                INSERT INTO seasons(title,starts_at,ends_at,status)
-                VALUES(%s,%s,%s,'active')
-            """, (parts[0].strip(), now, now + days * 86400))
-    await update.message.reply_text("تم إنشاء الموسم الجديد.")
-
-
-async def admin_end_season(update, context):
-    if not is_admin(update.effective_user.id):
-        return
-    now = int(time.time())
-    with connect() as con:
-        with con.cursor() as cur:
-            cur.execute("""
-                SELECT id FROM seasons WHERE status='active'
-                ORDER BY starts_at DESC LIMIT 1 FOR UPDATE
-            """)
-            s = cur.fetchone()
-            if not s:
-                await update.message.reply_text("لا يوجد موسم نشط.")
-                return
-            sid = s["id"]
-            cur.execute("""
-                WITH added AS (
-                    INSERT INTO season_deductions(season_id,player_id,deducted_points)
-                    SELECT %s,telegram_id,FLOOR(points*0.20)::int FROM players
-                    ON CONFLICT(season_id,player_id) DO NOTHING
-                    RETURNING player_id,deducted_points
-                )
-                UPDATE players p
-                SET points=GREATEST(0,p.points-a.deducted_points)
-                FROM added a WHERE p.telegram_id=a.player_id
-            """, (sid,))
-            cur.execute("UPDATE seasons SET status='ended',ends_at=%s WHERE id=%s", (now, sid))
-    await update.message.reply_text("انتهى الموسم وتم تطبيق خصم 20% مرة واحدة.")
-
-
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
-        return
-    uid = update.effective_user.id
-    text = update.message.text.strip()
-
-    # إدخال البيانات المطلوبة من لوحة الأدمن.
-    admin_action = context.user_data.get("admin_action")
-    if admin_action:
-        if not is_admin(uid):
-            context.user_data.pop("admin_action", None)
-            return
-        action_type = admin_action.get("type")
-        try:
-            if action_type == "points":
-                amount = int(text)
-                target_id = admin_action["target_id"]
-                with connect() as con:
-                    with con.cursor() as cur:
-                        cur.execute("""
-                            UPDATE players SET points=GREATEST(0,points+%s)
-                            WHERE telegram_id=%s RETURNING points
-                        """, (amount, target_id))
-                        row = cur.fetchone()
-                context.user_data.pop("admin_action", None)
-                if not row:
-                    await update.message.reply_text("اللاعب غير موجود.", reply_markup=admin_keyboard())
-                else:
-                    await update.message.reply_text(
-                        f"تم تعديل النقاط بنجاح.\nالرصيد الحالي: {row['points']}",
-                        reply_markup=admin_keyboard()
-                    )
-                return
-
-            if action_type == "season":
-                parts = text.split("|")
-                if len(parts) != 2 or not parts[0].strip():
-                    await update.message.reply_text("الصيغة غير صحيحة. أرسل: اسم الموسم|عدد الأيام")
-                    return
-                days = int(parts[1])
-                if days < 1:
-                    await update.message.reply_text("عدد الأيام يجب أن يكون 1 أو أكثر.")
-                    return
-                now = int(time.time())
-                with connect() as con:
-                    with con.cursor() as cur:
-                        cur.execute("UPDATE seasons SET status='ended' WHERE status='active'")
-                        cur.execute("""
-                            INSERT INTO seasons(title,starts_at,ends_at,status)
-                            VALUES(%s,%s,%s,'active')
-                        """, (parts[0].strip(), now, now + days * 86400))
-                context.user_data.pop("admin_action", None)
-                await update.message.reply_text("تم إنشاء الموسم الجديد بنجاح ✅", reply_markup=admin_keyboard())
-                return
-
-            if action_type == "tournament":
-                parts = text.split("|")
-                if len(parts) != 4 or not parts[0].strip():
-                    await update.message.reply_text("الصيغة: الاسم|الوصف|الجائزة|الحد الأقصى")
-                    return
-                prize, maxp = int(parts[2]), int(parts[3])
-                if prize < 0 or maxp < 2:
-                    await update.message.reply_text("الجائزة لا تقل عن صفر والحد الأقصى يجب أن يكون 2 أو أكثر.")
-                    return
-                with connect() as con:
-                    with con.cursor() as cur:
-                        cur.execute("""
-                            INSERT INTO tournaments(title,description,prize_points,max_players,created_by,created_at)
-                            VALUES(%s,%s,%s,%s,%s,%s) RETURNING id
-                        """, (parts[0].strip(), parts[1].strip(), prize, maxp, uid, int(time.time())))
-                        tid = cur.fetchone()["id"]
-                context.user_data.pop("admin_action", None)
-                await update.message.reply_text(
-                    f"تم إنشاء البطولة #{tid} وفتح التسجيل 🏆",
-                    reply_markup=admin_keyboard()
-                )
-                return
-        except ValueError:
-            await update.message.reply_text("القيمة غير صحيحة. أرسل الأرقام بشكل صحيح.")
-            return
-
-    p = player(uid)
-    if p and p.get("is_banned", False) and not is_admin(uid):
-        await update.message.reply_text("هذا الحساب موقوف حالياً.")
-        return
-
-    if text == "🎮 العب":
-        context.user_data["game"] = {"number": random.randint(1, 150), "attempt": 0}
-        await update.message.reply_text("🎮 خمن رقماً من 1 إلى 150. لديك 6 محاولات.")
-        return
-    if text == "👤 الملف الشخصي":
-        p = player(uid)
-        level = max(1, p["xp"] // 500 + 1)
-        await update.message.reply_text(
-            f"👤 الملف الشخصي\nالاسم: {p['display_name'] or 'لاعب'}\n"
-            f"النقاط: {p['points']}\nXP: {p['xp']}\nالمستوى: {level}\n"
-            f"الانتصارات: {p['wins']}\nالخسائر: {p['losses']}"
-        )
-        return
-    if text == "📊 التصنيف":
-        with connect() as con:
-            with con.cursor() as cur:
-                cur.execute("""
-                    SELECT display_name,username,points FROM players
-                    WHERE is_banned=FALSE ORDER BY points DESC,wins DESC LIMIT 10
-                """)
-                rows = cur.fetchall()
-        await update.message.reply_text(
-            "📊 أفضل 10 لاعبين:\n" + (
-                "\n".join(f"{i}. {r['display_name'] or r['username'] or 'لاعب'} — {r['points']} نقطة"
-                          for i, r in enumerate(rows, 1)) if rows else "لا يوجد لاعبون."
-            )
-        )
-        return
-    if text == "🎁 الدخول اليومي":
-        now = int(time.time())
-        with connect() as con:
-            with con.cursor() as cur:
-                cur.execute("SELECT last_daily FROM players WHERE telegram_id=%s FOR UPDATE", (uid,))
-                                row = cur.fetchone()
-                if row and now - (row["last_daily"] or 0) < 86400:
-                    await update.message.reply_text(
-                        "🎁 استلمت مكافأة الدخول اليومي بالفعل. ارجع بعد 24 ساعة."
-                    )
-                    return
-
-                daily_reward = 50
-                cur.execute(
-                    "UPDATE players SET points = points + %s, last_daily = %s WHERE telegram_id = %s",
-                    (daily_reward, now, uid)
-                )
-
-        await update.message.reply_text(
-            f"🎁 حصلت على {daily_reward} نقطة للدخول اليومي!"
-        )
-        return
-                                if row and now - (row["last_daily"] or 0) < 86400:
-                    await update.message.reply_text(
-                        "🎁 استلمت مكافأة الدخول اليومي بالفعل. ارجع بعد 24 ساعة."
-                    )
-                    return
-
-                daily_reward = 50
-                cur.execute(
-                    "UPDATE players SET points = points + %s, last_daily = %s WHERE telegram_id = %s",
-                    (daily_reward, now, uid)
-                )
-
-        await update.message.reply_text(
-            f"🎁 حصلت على {daily_reward} نقطة للدخول اليومي!"
-        )
-        return
