@@ -1066,4 +1066,4 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     (tid, uid)
                 )
                 joined = cur.fetchone()
-                if joined
+                if joined 
