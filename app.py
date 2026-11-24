@@ -1,3 +1,4 @@
+# GUESS ARENA build: 2026-11-24-fix-joined-check
 import os
 import time
 import random
@@ -1065,5 +1066,4 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "SELECT 1 FROM tournament_entries WHERE tournament_id=%s AND player_id=%s",
                     (tid, uid)
                 )
-                joined = cur.fetchone()
-                if joined 
+                j
