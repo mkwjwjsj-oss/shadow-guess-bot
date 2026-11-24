@@ -1162,4 +1162,48 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         WHERE telegram_id=%s
                     """, (pts, xp, uid))
             context.user_data.pop("game", None)
-            await update.message.reply_text(f"صحيح! ربحت {pts} نقطة 
+            await update.message.reply_text(f"صحيح! ربحت {pts} نقطة و{xp} XP 🎉")
+            return
+        if n >= 6:
+            answer = game["number"]
+            context.user_data.pop("game", None)
+            with connect() as con:
+                with con.cursor() as cur:
+                    cur.execute("UPDATE players SET losses=losses+1 WHERE telegram_id=%s", (uid,))
+            await update.message.reply_text(f"انتهت المحاولات. الرقم كان {answer}.")
+            return
+        await update.message.reply_text(
+            ("أكبر 🔼" if guess < game["number"] else "أصغر 🔽") + f"\nباقي {6-n} محاولات."
+        )
+        return
+
+    await update.message.reply_text("اختر من القائمة أو اكتب /start.", reply_markup=menu(uid))
+
+
+async def error_handler(update, context):
+    log.exception("Unhandled Telegram update error", exc_info=context.error)
+
+
+def main():
+    init_db()
+    start_health_server()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("myid", myid))
+    app.add_handler(CommandHandler("admin", admin_panel))
+    app.add_handler(CommandHandler("admin_stats", admin_stats))
+    app.add_handler(CommandHandler("admin_create_tournament", admin_create_tournament))
+    app.add_handler(CommandHandler("admin_points", admin_points))
+    app.add_handler(CommandHandler("admin_ban", admin_ban))
+    app.add_handler(CommandHandler("admin_unban", admin_unban))
+    app.add_handler(CommandHandler("admin_season", admin_season))
+    app.add_handler(CommandHandler("admin_end_season", admin_end_season))
+    app.add_handler(CallbackQueryHandler(callback_router))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_error_handler(error_handler)
+    log.info("GUESS ARENA Stage 2 started")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
