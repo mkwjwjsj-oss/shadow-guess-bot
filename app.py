@@ -1,3 +1,4 @@
+# GUESS ARENA - corrected full app.py
 # GUESS ARENA build: friends challenge integrated into original Stage 2
 import os
 import time
@@ -1284,4 +1285,4 @@ def main():
     app.add_handler(CommandHandler("admin_points", admin_points))
     app.add_handler(CommandHandler("admin_ban", admin_ban))
     app.add_handler(CommandHandler("admin_unban", admin_unban))
-    app.add_handler(CommandHandler("adm
+ 
