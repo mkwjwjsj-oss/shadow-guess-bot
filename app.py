@@ -174,6 +174,21 @@ def init_db():
                 )
             """)
             cur.execute("""
+                CREATE TABLE IF NOT EXISTS match_history (
+                    id BIGSERIAL PRIMARY KEY,
+                    player_id BIGINT NOT NULL REFERENCES players(telegram_id) ON DELETE CASCADE,
+                    result TEXT NOT NULL CHECK (result IN ('win', 'loss')),
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    points_earned INTEGER NOT NULL DEFAULT 0,
+                    xp_earned INTEGER NOT NULL DEFAULT 0,
+                    played_at BIGINT NOT NULL
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_match_history_player_time
+                ON match_history(player_id, played_at DESC)
+            """)
+            cur.execute("""
                 INSERT INTO shop_items(code, title, price, duration_hours, uses)
                 VALUES
                     ('POINTS_X2', 'مضاعفة النقاط', 75, 24, NULL),
@@ -501,7 +516,51 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"النقاط: {p['points']}\nXP: {p['xp']}\nالمستوى: {level}\n"
                 f"الانتصارات: {p['wins']}\nالخسائر: {p['losses']}\n"
                 f"الفريق: {team['name'] if team else 'بدون فريق'}",
-                reply_markup=back()
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📜 سجل مبارياتي", callback_data="m:history")],
+                    [InlineKeyboardButton("⬅️ القائمة الرئيسية", callback_data="m:home")]
+                ])
+            )
+            return
+        if action == "history":
+            with connect() as con:
+                with con.cursor() as cur:
+                    cur.execute("""
+                        SELECT result, attempts, points_earned, xp_earned, played_at
+                        FROM match_history WHERE player_id=%s
+                        ORDER BY played_at DESC, id DESC LIMIT 10
+                    """, (uid,))
+                    history = cur.fetchall()
+                    cur.execute("""
+                        SELECT COUNT(*) AS total,
+                               COUNT(*) FILTER (WHERE result='win') AS wins,
+                               COUNT(*) FILTER (WHERE result='loss') AS losses,
+                               COALESCE(SUM(points_earned),0) AS points,
+                               COALESCE(SUM(xp_earned),0) AS xp
+                        FROM match_history WHERE player_id=%s
+                    """, (uid,))
+                    totals = cur.fetchone()
+            lines = [
+                "📜 سجل آخر 10 مباريات",
+                f"إجمالي الجولات: {totals['total']} | فوز: {totals['wins']} | خسارة: {totals['losses']}",
+                f"مجموع النقاط المكتسبة: {totals['points']} | XP: {totals['xp']}",
+                ""
+            ]
+            for i, match in enumerate(history, 1):
+                status = "🏆 فوز" if match["result"] == "win" else "❌ خسارة"
+                stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(match["played_at"]))
+                lines.append(
+                    f"{i}. {status} — {match['attempts']} محاولات — "
+                    f"+{match['points_earned']} نقطة / +{match['xp_earned']} XP — {stamp}"
+                )
+            if not history:
+                lines.append("ما لعبت أي جولة لحد الآن.")
+            await q.edit_message_text(
+                "\n".join(lines),
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("👤 الملف الشخصي", callback_data="m:profile")],
+                    [InlineKeyboardButton("⬅️ القائمة الرئيسية", callback_data="m:home")]
+                ])
             )
             return
         if action == "rank":
@@ -638,6 +697,10 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         "UPDATE players SET points=points+%s,xp=xp+%s,wins=wins+1 WHERE telegram_id=%s",
                         (pts, xp, uid)
                     )
+                    cur.execute("""
+                        INSERT INTO match_history(player_id,result,attempts,points_earned,xp_earned,played_at)
+                        VALUES(%s,'win',%s,%s,%s,%s)
+                    """, (uid, n, pts, xp, int(time.time())))
             context.user_data.pop("game", None)
             await q.edit_message_text(
                 f"🎉 صحيح! ربحت {pts} نقطة و{xp} XP.",
@@ -653,6 +716,10 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             with connect() as con:
                 with con.cursor() as cur:
                     cur.execute("UPDATE players SET losses=losses+1 WHERE telegram_id=%s", (uid,))
+                    cur.execute("""
+                        INSERT INTO match_history(player_id,result,attempts,points_earned,xp_earned,played_at)
+                        VALUES(%s,'loss',%s,0,0,%s)
+                    """, (uid, n, int(time.time())))
             await q.edit_message_text(f"انتهت المحاولات. الرقم كان {answer}.", reply_markup=back())
             return
         hint = "أكبر 🔼" if guess < game["number"] else "أصغر 🔽"
@@ -1084,126 +1151,4 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             with con.cursor() as cur:
                 cur.execute("SELECT last_daily FROM players WHERE telegram_id=%s FOR UPDATE", (uid,))
                 row = cur.fetchone()
-                if row and now - row["last_daily"] >= 86400:
-                    cur.execute("UPDATE players SET xp=xp+20,last_daily=%s WHERE telegram_id=%s", (now, uid))
-                    msg = "🎁 حصلت على 20 XP!"
-                else:
-                    msg = "استلمت مكافأتك اليومية بالفعل. ارجع لاحقاً."
-        await update.message.reply_text(msg)
-        return
-    if text == "👥 الفرق":
-        await update.message.reply_text("👥 نظام الفرق: إنشاء الفريق والانضمام إليه متاحان من أزرار القائمة.")
-        return
-    if text == "🏆 البطولات":
-        with connect() as con:
-            with con.cursor() as cur:
-                cur.execute("SELECT id,title,prize_points FROM tournaments WHERE status='open' ORDER BY created_at DESC LIMIT 15")
-                rows = cur.fetchall()
-        await update.message.reply_text(
-            "🏆 البطولات:\n" + ("\n".join(f"#{r['id']} {r['title']} — {r['prize_points']} نقطة" for r in rows)
-                              if rows else "لا توجد بطولات مفتوحة.")
-        )
-        return
-    if text == "🛒 المتجر":
-        with connect() as con:
-            with con.cursor() as cur:
-                cur.execute("SELECT title,price FROM shop_items WHERE active=TRUE ORDER BY price")
-                rows = cur.fetchall()
-        await update.message.reply_text("🛒 المتجر:\n" + "\n".join(f"{r['title']} — {r['price']} نقطة" for r in rows))
-        return
-    if text == "🎒 مخزني":
-        with connect() as con:
-            with con.cursor() as cur:
-                cur.execute("""
-                    SELECT s.title,i.remaining_uses FROM inventory i
-                    JOIN shop_items s ON s.id=i.item_id
-                    WHERE i.player_id=%s AND (i.remaining_uses IS NULL OR i.remaining_uses>0)
-                    AND (i.expires_at IS NULL OR i.expires_at>%s)
-                    ORDER BY i.purchased_at DESC
-                """, (uid, int(time.time())))
-                rows = cur.fetchall()
-        await update.message.reply_text(
-            "🎒 مخزني:\n" + ("\n".join(f"• {r['title']}" for r in rows) if rows else "مخزونك فارغ.")
-        )
-        return
-    if text == "📅 الموسم":
-        with connect() as con:
-            with con.cursor() as cur:
-                cur.execute("SELECT title FROM seasons WHERE status='active' ORDER BY starts_at DESC LIMIT 1")
-                row = cur.fetchone()
-        await update.message.reply_text(f"📅 {row['title']}" if row else "لا يوجد موسم نشط حالياً.")
-        return
-    if text == "🛠 لوحة الأدمن" or text == "/admin":
-        await admin_panel(update, context)
-        return
-    if text == "👫 الأصدقاء":
-        await update.message.reply_text("قسم الأصدقاء قيد التطوير.")
-        return
-
-    game = context.user_data.get("game")
-    if game:
-        try:
-            guess = int(text)
-        except ValueError:
-            await update.message.reply_text("أرسل رقماً من 1 إلى 150.")
-            return
-        if not 1 <= guess <= 150:
-            await update.message.reply_text("الرقم يجب أن يكون بين 1 و150.")
-            return
-        game["attempt"] += 1
-        n = game["attempt"]
-        if guess == game["number"]:
-            pts = [10, 8, 6, 4, 2, 1][n-1]
-            xp = [100, 85, 70, 60, 50, 40][n-1]
-            with connect() as con:
-                with con.cursor() as cur:
-                    cur.execute("""
-                        UPDATE players SET points=points+%s,xp=xp+%s,wins=wins+1
-                        WHERE telegram_id=%s
-                    """, (pts, xp, uid))
-            context.user_data.pop("game", None)
-            await update.message.reply_text(f"صحيح! ربحت {pts} نقطة و{xp} XP 🎉")
-            return
-        if n >= 6:
-            answer = game["number"]
-            context.user_data.pop("game", None)
-            with connect() as con:
-                with con.cursor() as cur:
-                    cur.execute("UPDATE players SET losses=losses+1 WHERE telegram_id=%s", (uid,))
-            await update.message.reply_text(f"انتهت المحاولات. الرقم كان {answer}.")
-            return
-        await update.message.reply_text(
-            ("أكبر 🔼" if guess < game["number"] else "أصغر 🔽") + f"\nباقي {6-n} محاولات."
-        )
-        return
-
-    await update.message.reply_text("اختر من القائمة أو اكتب /start.", reply_markup=menu(uid))
-
-
-async def error_handler(update, context):
-    log.exception("Unhandled Telegram update error", exc_info=context.error)
-
-
-def main():
-    init_db()
-    start_health_server()
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("myid", myid))
-    app.add_handler(CommandHandler("admin", admin_panel))
-    app.add_handler(CommandHandler("admin_stats", admin_stats))
-    app.add_handler(CommandHandler("admin_create_tournament", admin_create_tournament))
-    app.add_handler(CommandHandler("admin_points", admin_points))
-    app.add_handler(CommandHandler("admin_ban", admin_ban))
-    app.add_handler(CommandHandler("admin_unban", admin_unban))
-    app.add_handler(CommandHandler("admin_season", admin_season))
-    app.add_handler(CommandHandler("admin_end_season", admin_end_season))
-    app.add_handler(CallbackQueryHandler(callback_router))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    app.add_error_handler(error_handler)
-    log.info("GUESS ARENA Stage 2 started")
-    app.run_polling()
-
-
-if __name__ == "__main__":
-    main()
+                if row and now - row["last_daily"
